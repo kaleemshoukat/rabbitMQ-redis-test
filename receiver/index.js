@@ -1,71 +1,87 @@
 const amqp = require('amqplib');
-const redis = require('redis');
+const {
+    getFromCache,
+    cacheResult,
+    getProcessedTaskCount,
+    incrementProcessedTaskCount
+} = require("./helper");
 
-const redisClient = redis.createClient({
-    host: 'localhost',
-    port: 6379,
-});
+async function startSupervisor() {
+    const taskQueue = 'tasks_queue';
+    const connection = await amqp.connect('amqp://localhost');
+    const channel = await connection.createChannel();
 
-redisClient.ping((err, result) => {
-    if (err) {
-        console.error('Error connecting to Redis:', err);
-    } else {
-        console.log('Connected to Redis:', result);
-    }
-});
+    await channel.assertQueue(taskQueue, { durable: false });
 
-async function processTask(task) {
-    try {
-        // Simulate time-consuming task processing
-        await new Promise(resolve => setTimeout(resolve, task.complexity * 1000));
+    console.log('Supervisor is running. Waiting for tasks...');
 
-        const result = `Processed task ${task.id} with complexity ${task.complexity}`;
-        console.log(result);
+    await channel.consume(taskQueue, async (msg) => {
+        const task = JSON.parse(msg.content.toString());
+        console.log(`Received task: ${JSON.stringify(task)}`);
 
-        // Cache the result in Redis
-        redisClient.set(task.id, JSON.stringify(result));
+        // Check if result is cached
+        const cachedResult = await getFromCache(task.id);
+        if (cachedResult) {
+            console.log(`Result already cached: ${cachedResult}`);
+        } else {
+            // Distribute task to workers
+            const result = await distributeTask(task);
 
-        return result;
-    } catch (error) {
-        console.error('Error processing task:', error);
-        throw error;
-    }
+            // Cache the result
+            await cacheResult(task.id, result);
+
+            console.log(`Result cached: ${result}`);
+        }
+
+        channel.ack(msg);
+    });
 }
 
-async function startWorker() {
-    try {
-        const connection = await amqp.connect('amqp://localhost');
-        const channel = await connection.createChannel();
-        const queue = 'tasks_queue';
+async function distributeTask(task) {
+    const workerNodes = ['localhost'];
 
-        await channel.assertQueue(queue, { durable: false });
+    // Get the number of tasks processed by each worker
+    const tasksProcessed = await Promise.all(workerNodes.map(async (workerNode) => {
+        const processedTaskCount = await getProcessedTaskCount(workerNode);
+        return { workerNode, processedTaskCount };
+    }));
 
-        console.log('Worker node waiting for tasks...');
+    // Sort workers by the number of processed tasks in ascending order
+    const sortedWorkers = tasksProcessed.sort((a, b) => a.processedTaskCount - b.processedTaskCount);
 
-        await channel.consume(queue, async (msg) => {
-            try {
-                const task = JSON.parse(msg.content.toString());
-                console.log(`Received task: ${JSON.stringify(task)}`);
+    // Select the worker with the least processed tasks
+    const selectedWorker = sortedWorkers[0].workerNode;
 
-                // Check if result is cached
-                const cachedResult = await new Promise(resolve => redisClient.get(task.id, (_, result) => resolve(result)));
-                if (cachedResult) {
-                    console.log(`Result already cached: ${cachedResult}`);
-                } else {
-                    const result = await processTask(task);
-                    console.log(`Sending result back: ${result}`);
-                }
+    // Send the task to the selected worker
+    const result = await sendMessageToWorker(selectedWorker, task);
 
-                channel.ack(msg);
-            } catch (error) {
-                console.error('Error processing message:', error);
-                channel.reject(msg, false); // Reject the message to remove it from the queue
-            }
-        });
-    } catch (error) {
-        console.error('Error connecting to RabbitMQ:', error);
-        setTimeout(() => process.exit(1), 5000); // Exit the process after 5 seconds on error
-    }
+    // Update the processed task count for the selected worker
+    await incrementProcessedTaskCount(selectedWorker);
+
+    return result;
 }
 
-startWorker();
+async function sendMessageToWorker(workerNode, task) {
+    const connection = await amqp.connect(`amqp://${workerNode}`);
+    const channel = await connection.createChannel();
+
+    await channel.assertQueue('', { exclusive: true });     //auto unique queue name
+    const queue = channel.queue;
+
+    // Send task to worker
+    await channel.sendToQueue(queue, Buffer.from(JSON.stringify(task)));
+
+    // Wait for the result
+    const resultMessage = await new Promise(resolve => {
+        channel.consume(queue, msg => {
+            resolve(msg.content.toString());
+            channel.ack(msg);
+        }, { noAck: false });
+    });
+
+    connection.close();
+
+    return resultMessage;
+}
+
+startSupervisor();
